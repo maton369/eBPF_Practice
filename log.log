@@ -1,17 +1,20 @@
-[1] building BPF (compile+load)...
-[2] BPF built.
-[3] entering user loop (printing every 2s)...
-[tick] dump counter_table
-(no entries yet)
-[tick] dump counter_table
-ID 1000: 7	
-[tick] dump counter_table
-ID 1000: 7	
-[tick] dump counter_table
-ID 1000: 14	
-[tick] dump counter_table
-ID 1000: 14	
-[tick] dump counter_table
-ID 1000: 21	
-[tick] dump counter_table
-ID 1000: 21	
+15020 1000 bash Hello World
+15024 1000 bash Hello World
+15025 1000 bash Hello World
+15032 1000 bash Hello World
+15029 1000 bash Hello World
+15031 1000 bash Hello World
+15030 1000 bash Hello World
+15041 1000 bash Hello World
+15046 1000 bash Hello World
+15045 1000 bash Hello World
+15051 1000 bash Hello World
+15052 1000 bash Hello World
+15053 1000 bash Hello World
+15050 1000 bash Hello World
+15066 1000 bash Hello World
+15065 1000 bash Hello World
+15073 1000 bash Hello World
+15072 1000 bash Hello World
+15070 1000 bash Hello World
+15071 1000 bash Hello World
