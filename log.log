@@ -1,0 +1,17 @@
+[1] building BPF (compile+load)...
+[2] BPF built.
+[3] entering user loop (printing every 2s)...
+[tick] dump counter_table
+(no entries yet)
+[tick] dump counter_table
+ID 1000: 7	
+[tick] dump counter_table
+ID 1000: 7	
+[tick] dump counter_table
+ID 1000: 14	
+[tick] dump counter_table
+ID 1000: 14	
+[tick] dump counter_table
+ID 1000: 21	
+[tick] dump counter_table
+ID 1000: 21	

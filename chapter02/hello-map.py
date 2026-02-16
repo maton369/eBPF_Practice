@@ -1,143 +1,166 @@
 #!/usr/bin/python3
 # =============================================================================
-# BCC を使った eBPF "Hello World" (kprobe + bpf_trace_printk) の最小例
+# 【あなたの環境で動く版】BCC + eBPF: UID ごとの execve/execveat 回数をカウント
 # =============================================================================
 #
-# 目的
-#   execve 系システムコール（= 新しいプログラムを実行する処理）のカーネル実装関数に
-#   kprobe を仕掛け、呼ばれるたびにカーネル側 eBPF から "Hello World!" を出力する。
+# 背景（今回の環境差のポイント）
+#   あなたの Ubuntu(guest, VirtualBox) 環境では、
+#     - kprobe で __x64_sys_execve 等に刺しても「刺さるが発火しない」ケースがあった
+#     - raw tracepoint sys_enter も ctx の解釈が合わず、syscall番号フィルタが機能しなかった
+#   ため、最も安定して動いた
+#     - syscalls:sys_enter_execve / syscalls:sys_enter_execveat の tracepoint
+#   を正面から使う方式（TRACEPOINT_PROBE マクロ）に寄せる。
 #
-# このコードで学べること（全体像）
-#   1) ユーザ空間(Python) から eBPF プログラムをロードする
-#   2) kprobe で「カーネル関数の入口」をフックする
-#   3) eBPF 側で bpf_trace_printk を使い、trace_pipe にログを流す
-#   4) ユーザ空間で trace_pipe を読み続けて表示する
+# このスクリプトの目的
+#   - execve / execveat（プロセス生成＝実行）イベントが発生するたびに
+#     “実効 UID” ごとのカウントを 1 増やす
+#   - カウントは eBPF map（counter_table）に保持し、ユーザ空間(Python)で定期表示する
 #
-# 注意（重要）
-#   - eBPF のロードや kprobe の attach には通常 root 権限が必要。
-#   - bpf_trace_printk はデバッグ用途（遅い／出力制限あり）で、本格的には
-#     ring buffer / perf buffer / map でユーザ空間へデータを渡す。
-#   - execve は OS 全体で頻繁に呼ばれるため、ログが洪水になりやすい。
-#     今回あなたのログに apt-check / update-notifier が大量に出たのは正常。
+# 実行方法（重要: 権限）
+#   sudo -E /usr/bin/python3 -u hello-map.py
 #
-# 実行時の典型
-#   sudo /usr/bin/python3 hello.py
+# 動作確認（同じゲストUbuntu内の別ターミナルで）
+#   /bin/echo hello
+#   /usr/bin/ls >/dev/null
+#   を何回か叩くと、UID=1000 などのカウントが増える
 #
 # =============================================================================
 
 from bcc import BPF
-import sys
+from time import sleep
 
 # -----------------------------------------------------------------------------
-# eBPF プログラム本体（C 風のコードを文字列として埋め込む）
+# eBPF プログラム（C 風コード）
 # -----------------------------------------------------------------------------
-# BCC はこの文字列を:
-#   - clang/LLVM で BPF バイトコードへコンパイル
-#   - bpf(BPF_PROG_LOAD, ...) でカーネルへロード
-# する。
-#
-# eBPF は「カーネル空間で安全に動く」必要があるため、ロード時に verifier が検証する。
-# ここでは危険なメモリアクセス等をしていないので通りやすい。
-#
-# `r""" ... """` の r は raw 文字列で、\n などのエスケープを意識せず書ける。
 program = r"""
-int hello(void *ctx) {
-    // ---------------------------------------------------------
-    // bpf_trace_printk:
-    //   カーネル空間から tracing サブシステムへ文字列を出すデバッグ用 helper。
+#include <uapi/linux/ptrace.h>
+
+// BPF_HASH(counter_table, u32, u64);
+//   - eBPF map（ハッシュ）を 1 個定義する
+//   - key: u32 = UID（通常 32bit）
+//   - val: u64 = カウンタ（増え続けるので 64bit）
+//
+// ※元サンプルは型省略（BPF_HASH(counter_table);）だが、型を明示すると
+//   ユーザ空間側の key/value 解釈が安定し、環境差で事故りにくい。
+BPF_HASH(counter_table, u32, u64);
+
+// ----------------------------------------------------------------------------
+// 共通処理: その時点の UID のカウンタを 1 増やす
+// ----------------------------------------------------------------------------
+static __always_inline int count_up(void) {
+    // bpf_get_current_uid_gid():
+    //   64bit の戻り値に (gid<<32 | uid) が詰まっている
+    //   下位32bitが UID なので取り出して u32 として扱う
+    u32 uid = (u32)(bpf_get_current_uid_gid() & 0xFFFFFFFF);
+
+    // 初回挿入用 0
+    u64 zero = 0;
+
+    // lookup_or_init:
+    //   - すでに uid のエントリがあれば、その値へのポインタが返る
+    //   - なければ zero で初期化して挿入し、その値へのポインタが返る
     //
-    // 出力先:
-    //   /sys/kernel/debug/tracing/trace_pipe
-    //   または /sys/kernel/tracing/trace_pipe (環境による)
-    //
-    // 制約/注意:
-    //   - デバッグ用途で遅い（頻繁なイベントだと性能が落ちる）
-    //   - 出力できる文字列やフォーマットが制限される
-    //   - ログが多いと trace バッファが埋まり、ドロップすることがある
-    //
-    // 今回は最小例として固定文字列を出すだけにしている。
-    bpf_trace_printk("Hello World!");
+    // 元サンプルの
+    //   lookup -> NULL判定 -> counter取り出し -> counter++ -> update
+    // を、より短く安全にしたもの。
+    u64 *p = counter_table.lookup_or_init(&uid, &zero);
+
+    // verifier 観点で NULL チェックは必須（NULL の可能性は 0 ではない）
+    if (p) {
+        // 注意（並行性）:
+        //   同一 UID のイベントが高頻度で多CPU同時に発生すると、
+        //   ここは read-modify-write なので取りこぼしが起き得る。
+        //   学習用としては十分だが、厳密な集計では PERCPU map を検討する。
+        (*p)++;
+    }
     return 0;
+}
+
+// ----------------------------------------------------------------------------
+// 【あなたの環境で安定】tracepoint: syscalls:sys_enter_execve
+// ----------------------------------------------------------------------------
+// TRACEPOINT_PROBE(syscalls, sys_enter_execve)
+//   - “syscalls” カテゴリの “sys_enter_execve” tracepoint に対応する。
+//   - BCC が定番として用意している書き方で、環境差に強い。
+//   - 引数（ctx）は今回使わないので参照しない。
+TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
+    return count_up();
+}
+
+// ----------------------------------------------------------------------------
+// tracepoint: syscalls:sys_enter_execveat
+// ----------------------------------------------------------------------------
+// execve だけでなく execveat 経由もあるため、両方カウントして取りこぼしを減らす。
+TRACEPOINT_PROBE(syscalls, sys_enter_execveat) {
+    return count_up();
 }
 """
 
 # -----------------------------------------------------------------------------
-# eBPF のコンパイル＆ロード
+# ユーザ空間側: eBPF をコンパイル/ロード
 # -----------------------------------------------------------------------------
-# BPF(text=program) の時点で:
-#   - eBPF をコンパイル
-#   - カーネルへロード可能なオブジェクトを構築
-# が行われる。
-#
-# ここで失敗する場合の典型:
-#   - bcc/python バインディング不足
-#   - kernel headers 不一致
-#   - verifier に弾かれた
+print("[1] building BPF (compile+load)...", flush=True)
 b = BPF(text=program)
+print("[2] BPF built.", flush=True)
 
 # -----------------------------------------------------------------------------
-# execve の「実際のカーネル関数名」を解決する
+# ここが “元サンプルからの重要な変更点”
 # -----------------------------------------------------------------------------
-# 重要ポイント:
-#   ユーザが知っている syscall 名は "execve" でも、
-#   カーネル内部の実装関数名は環境で異なることがある。
+# 元サンプル:
+#   syscall = b.get_syscall_fnname("execve")
+#   b.attach_kprobe(event=syscall, fn_name="hello")
 #
-# 例（ありがちな差分）:
-#   - __x64_sys_execve
-#   - __arm64_sys_execve
-#   - sys_execve
-#   - __se_sys_execve
+# あなたの環境では kprobe が「刺さるが発火しない」ことがあったので、
+# syscalls tracepoint に寄せる（TRACEPOINT_PROBE を使う）構成に変更した。
 #
-# これを手で決め打ちすると、別環境で動かない。
-# BCC の get_syscall_fnname("execve") は「この環境の正しい名前」を返す。
-syscall = b.get_syscall_fnname("execve")
+# そのため Python 側で attach_kprobe / attach_tracepoint を明示しない。
+# BPF(text=...) でプログラムをロードした時点で、
+# TRACEPOINT_PROBE が対応する tracepoint に結び付く形になりやすく、安定する。
+
+print("[3] entering user loop (printing every 2s)...", flush=True)
 
 # -----------------------------------------------------------------------------
-# kprobe を attach（カーネル関数の入口にフック）
+# 2 秒ごとに map を読み出して UID ごとのカウントを表示
 # -----------------------------------------------------------------------------
-# attach_kprobe(event=..., fn_name=...):
-#   - event: フック対象のカーネル関数名
-#   - fn_name: 発火したときに呼ぶ eBPF 関数名（program 内で定義した hello）
-#
-# これにより、カーネルが execve 実装関数へ入る瞬間に hello(ctx) が実行される。
-#
-# ここが失敗するときの典型:
-#   - root 権限がない（Need super-user privileges / EPERM）
-#   - 対象関数が存在しない（関数名解決ミス）
-#   - カーネルのセキュリティ設定で禁止されている
-b.attach_kprobe(event=syscall, fn_name="hello")
+while True:
+    sleep(2)
 
-# -----------------------------------------------------------------------------
-# trace_pipe を読み続けて表示する（Ctrl+C まで）
-# -----------------------------------------------------------------------------
-# b.trace_print():
-#   bpf_trace_printk の出力を、ユーザ空間で読み続ける便利関数。
-#
-# あなたの実行ログで:
-#   update-notifier, apt-check, lsb_release などが大量に出たのは、
-#   それらのプロセスが execve を呼び、kprobe が発火したため。
-#
-# 出力行の構造（概略）:
-#   <comm>-<pid> [cpu] ... <timestamp>: bpf_trace_printk: Hello World!
-#
-# comm:
-#   その時点のプロセス名（例: apt-check）
-# pid:
-#   プロセスID
-# cpu:
-#   実行されたCPU番号
-# timestamp:
-#   tracing のタイムスタンプ（秒）
-try:
-    b.trace_print()
-except KeyboardInterrupt:
-    # Ctrl+C で終了したときの後始末
-    sys.exit(0)
+    # 表示の “無反応” を減らすため、tick を出す
+    print("[tick] dump counter_table", flush=True)
+
+    s = ""
+    for k, v in b["counter_table"].items():
+        # k.value: UID（u32）
+        # v.value: execve/execveat 回数（u64）
+        s += f"ID {k.value}: {v.value}\t"
+
+    # map が空なら空だと分かる表示にする
+    print(s if s else "(no entries yet)", flush=True)
 
 # =============================================================================
-# 次の一歩（発展の方向性）
+# 動作イメージ（図解）
 # =============================================================================
-# - ログ洪水を抑える: PID/comm/UID でフィルタする
-# - printk を卒業する: ring buffer / perf buffer / map で構造化データを渡す
-# - 安定性を上げる: kprobe ではなく tracepoint を使う（用途次第）
+#
+#      execve/execveat 発生（/bin/echo, ls などが実行される）
+#  ┌──────────────────────────────────────────────────────────────┐
+#  │ ユーザ空間プロセス                                           │
+#  │   /bin/echo hello                                            │
+#  │   /usr/bin/ls                                                │
+#  └───────────────┬──────────────────────────────────────────────┘
+#                  │
+#                  ▼
+#        tracepoint: syscalls:sys_enter_execve / sys_enter_execveat
+#                  │
+#                  ▼
+#        eBPF: TRACEPOINT_PROBE(...) → count_up()
+#                  │
+#                  ▼
+#        counter_table[uid]++  （カーネル内 map 更新）
+#                  │
+#                  ▼
+#  ┌──────────────────────────────────────────────────────────────┐
+#  │ Python ループ（2秒ごと）                                     │
+#  │   b["counter_table"].items() で map を読み出して表示          │
+#  └──────────────────────────────────────────────────────────────┘
+#
 # =============================================================================
