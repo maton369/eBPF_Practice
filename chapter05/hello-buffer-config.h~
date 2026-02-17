@@ -1,0 +1,100 @@
+/*
+ * hello-buffer-config.h
+ *
+ * 目的:
+ *   eBPF 側（カーネル側）とユーザ空間側（libbpf/bcc 側）で
+ *   「同じメモリレイアウト」を共有するためのヘッダである。
+ *
+ *   eBPF プログラムがイベントとして struct data_t を埋めて
+ *   bpf_perf_event_output() / ringbuf_output() 等でユーザ空間へ送る。
+ *   ユーザ空間側は受信した生バイト列を struct data_t* として解釈し、
+ *   pid/uid/command/path/message を読み取って表示する。
+ *
+ * なぜヘッダを共有する必要があるのか:
+ *   - eBPF → ユーザ空間へ渡されるデータは「ただのバイト列」
+ *   - 受信側が struct data_t としてキャストして読むため、
+ *     フィールド順・サイズ・アラインメントが一致していないと
+ *     値が壊れる、文字列が崩れる、最悪クラッシュする。
+ *
+ * 重要な注意点（レイアウト/互換性）:
+ *   - eBPF 側とユーザ空間側は「同じ struct 定義」を使うこと
+ *   - int のサイズは通常 4 バイトだが、環境依存を避けるなら
+ *     __u32 / uint32_t を使うのがより堅い（eBPF では特に）
+ *   - 文字列配列は NUL 終端が保証されない可能性がある。
+ *     eBPF 側で bpf_probe_read_*_str を使うと NUL 終端されやすい。
+ *     それでも安全側に倒すなら、ユーザ空間側で終端処理するのが堅い。
+ *
+ * フィールドの意味（想定）:
+ *   - pid     : イベントを発生させたプロセスID
+ *   - uid     : イベントを発生させたユーザID
+ *   - command : プロセス名（comm）。bpf_get_current_comm() で取得する想定
+ *   - message : 表示用メッセージ（ユーザ別設定 or デフォルト等）
+ *   - path    : execve などで渡されたパス文字列（bpf_probe_read_user_str 等）
+ *
+ * サイズ設計について:
+ *   - command[16] は Linux の TASK_COMM_LEN(=16) に合わせた典型サイズ
+ *   - message[12], path[16] はデモ用に小さめ。長い文字列は切り詰められる。
+ *     実用ではもう少し余裕を持たせる（例: path[256]）ことが多い。
+ */
+
+#ifndef HELLO_BUFFER_CONFIG_H
+#define HELLO_BUFFER_CONFIG_H
+
+/*
+ * eBPF からユーザ空間へ送るイベント本体。
+ *
+ * 注意:
+ *   フィールド順を変えると互換性が壊れるので、
+ *   既にユーザ空間がこの順で読む前提なら順序変更は慎重に行うこと。
+ */
+struct data_t {
+    /*
+     * pid: Process ID
+     *   bpf_get_current_pid_tgid() の上位 32bit を使うのが定番。
+     *   例: data.pid = bpf_get_current_pid_tgid() >> 32;
+     */
+    int pid;
+
+    /*
+     * uid: User ID
+     *   bpf_get_current_uid_gid() の下位 32bit を使うのが定番。
+     *   例: data.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+     */
+    int uid;
+
+    /*
+     * command: プロセス名（comm）
+     *   Linux では最大 15 文字 + '\0' で 16 バイト（TASK_COMM_LEN）。
+     *   eBPF 側では bpf_get_current_comm() で埋める想定。
+     *
+     * NOTE:
+     *   - 常に NUL 終端される想定だが、念のためユーザ空間側で
+     *     安全に出力したい場合は終端を保証する処理を入れると堅い。
+     */
+    char command[16];
+
+    /*
+     * message: 表示用の短いメッセージ
+     *   例:
+     *     - UID ごとに "Hey root!" / "Hi user!" を出し分ける
+     *     - デフォルトは "Hello World"
+     *
+     * NOTE:
+     *   - サイズが 12 バイトなので長い文字列は切れる
+     *   - eBPF 側が bpf_probe_read_kernel_str を使えば NUL 終端されやすい
+     */
+    char message[12];
+
+    /*
+     * path: execve の pathname など
+     *   eBPF 側でユーザ空間のポインタ (const char *pathname) から
+     *   bpf_probe_read_user_str() などで読み取る想定。
+     *
+     * NOTE:
+     *   - 16 バイトしかないので、実際のパスはほぼ確実に切れる。
+     *     デモ用途として割り切っている構成。
+     */
+    char path[16];
+};
+
+#endif /* HELLO_BUFFER_CONFIG_H */
