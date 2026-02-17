@@ -1,0 +1,164 @@
+/*
+ * hello-buffer-config.bpf.c（eBPF 側 / CO-RE + libbpf 想定）
+ *
+ * 目的:
+ *   execve(2) をフックし、ユーザ空間へ「実行イベント」を通知する eBPF プログラムである。
+ *   execve が呼ばれるたびに、以下を収集して perf buffer で送信する:
+ *     - pid (TGID)
+ *     - uid
+ *     - comm（プロセス名）
+ *     - pathname（execve の第1引数）
+ *     - uid に応じた message（設定があればそれ、なければ "Hello World"）
+ *
+ * 重要（今回のコンパイルエラー修正ポイント）:
+ *   あなたのエラーは、
+ *
+ *     int BPF_KPROBE_SYSCALL(hello, const char *pathname)
+ *                                     ^ expected identifier
+ *     ... pathname undeclared ...
+ *     ... ctx undeclared ...
+ *
+ *   となっていた。これは典型的に
+ *   「BPF_KPROBE_SYSCALL マクロの使い方が環境の libbpf/bpf_tracing.h と合っていない」
+ *   ことで起きる。
+ *
+ *   そこで、より互換性が高い書き方に寄せる:
+ *
+ *     SEC("ksyscall/execve")
+ *     int BPF_KSYSCALL(hello, const char *pathname, const char *const *argv, const char *const *envp)
+ *
+ *   これにより
+ *     - ctx を直接扱わずに済む（bpf_perf_event_output の第一引数が不要）
+ *     - 引数も「syscall そのものの形」で受けられる
+ *
+ *   そして、イベント送出は
+ *
+ *     bpf_perf_event_output((void *)ctx, &output, ...)
+ *
+ *   ではなく、BPF_KSYSCALL の文脈で提供される ctx（暗黙）を使う必要もなく、
+ *   libbpf が提供する「引数だけの関数」内でも bpf_perf_event_output の第一引数は
+ *   *コンテキストとして第一引数（実際には pt_regs 相当）が必要* なので、
+ *   BPF_KSYSCALL マクロの展開により ctx が利用可能な形になる（ここが互換性の肝）。
+ *
+ *   ※もしあなたの環境で BPF_KSYSCALL が無い場合は、
+ *     「SEC("kprobe/__x64_sys_execve") + BPF_KPROBE(...)」に落とすのが次の手。
+ *     ただしアーキ依存になるので、まずは BPF_KSYSCALL を採用する。
+ *
+ * CO-RE（Compile Once – Run Everywhere）の観点:
+ *   - vmlinux.h（BTF から生成）を include し、カーネル型の差異を吸収する土台を作る。
+ *   - 今回は task_struct を直接読んでいないので CO-RE READ は必須ではないが、
+ *     「フックポイントやヘルパ API を安定して使う」意味で CO-RE 流儀に寄せている。
+ */
+
+#include "vmlinux.h"            /* CO-RE 用: カーネル型定義（BTF由来） */
+#include <bpf/bpf_helpers.h>    /* SEC(), helper, map 定義補助 */
+#include <bpf/bpf_tracing.h>    /* BPF_KSYSCALL / BPF_KPROBE 系マクロ */
+#include <bpf/bpf_core_read.h>  /* CO-RE READ マクロ群（今回は直接は未使用） */
+
+#include "hello-buffer-config.h" /* struct data_t を共有（ユーザ空間と ABI 一致必須） */
+
+/* ライセンス（GPL 互換なら一部 helper が利用可能になる） */
+char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
+/*
+ * デフォルトメッセージ（固定長）
+ * "Hello World" = 11 + '\0' = 12 bytes なので data.message[12] に収まる。
+ *
+ * NOTE:
+ *   bpf_probe_read_kernel_str で読む前提なので “カーネル側メモリ” に置いておく。
+ */
+static const char default_message[12] = "Hello World";
+
+/*
+ * perf event array map（ユーザ空間の perf_buffer が購読する）
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+} output SEC(".maps");
+
+/*
+ * UID -> message の設定を格納する map
+ */
+struct user_msg_t {
+    char message[12];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u32);               /* UID */
+    __type(value, struct user_msg_t); /* message */
+} my_config SEC(".maps");
+
+/*
+ * execve syscall をフックする。
+ *
+ * SEC("ksyscall/execve") は libbpf 側で “syscall トレース用の BPF プログラム” として扱われ、
+ * BPF_KSYSCALL マクロで syscall の引数を C の関数引数として受け取れる。
+ *
+ * 引数:
+ *   pathname : ユーザ空間ポインタ（必ず bpf_probe_read_user_str で読む）
+ *   argv     : ユーザ空間ポインタ（今回は使わない）
+ *   envp     : ユーザ空間ポインタ（今回は使わない）
+ *
+ * 戻り値:
+ *   0（トレース系なので XDP の PASS/DROP のような意味はない）
+ */
+SEC("ksyscall/execve")
+int BPF_KSYSCALL(hello, const char *pathname,
+                 const char *const *argv, const char *const *envp)
+{
+    struct data_t data = {};     /* 送信ペイロード（ゼロ初期化で verifier に優しい） */
+    __u32 uid;
+    __u64 pid_tgid;
+
+    /* argv/envp は今回は未使用（警告抑制） */
+    (void)argv;
+    (void)envp;
+
+    /* pid/tgid を取得（上位32bitが TGID = “一般に pid と呼ぶ値”） */
+    pid_tgid = bpf_get_current_pid_tgid();
+    data.pid = pid_tgid >> 32;
+
+    /* uid/gid を取得（下位32bitが UID） */
+    uid = (__u32)(bpf_get_current_uid_gid() & 0xFFFFFFFF);
+    data.uid = (int)uid;
+
+    /* comm（プロセス名）を取得（TASK_COMM_LEN=16） */
+    bpf_get_current_comm(&data.command, sizeof(data.command));
+
+    /*
+     * pathname をユーザ空間からコピー（NUL 終端考慮）
+     * data.path は hello-buffer-config.h 側で固定長（例: 256 推奨だが、ここではあなたの定義に従う）
+     */
+    bpf_probe_read_user_str(&data.path, sizeof(data.path), pathname);
+
+    /*
+     * UID ごとの設定メッセージを参照
+     * - map value はカーネル側メモリなので bpf_probe_read_kernel_str を使う
+     */
+    {
+        struct user_msg_t *p = bpf_map_lookup_elem(&my_config, &uid);
+        if (p) {
+            bpf_probe_read_kernel_str(&data.message, sizeof(data.message), p->message);
+        } else {
+            bpf_probe_read_kernel_str(&data.message, sizeof(data.message), default_message);
+        }
+    }
+
+    /*
+     * perf buffer へイベント送信
+     *
+     * bpf_perf_event_output の第1引数 ctx は、
+     * BPF_KSYSCALL マクロの展開により「適切なコンテキスト」が参照できる形になっている。
+     *
+     * - &output : PERF_EVENT_ARRAY map
+     * - BPF_F_CURRENT_CPU : 現在 CPU のバッファへ出力
+     * - &data, sizeof(data) : ペイロード
+     */
+    bpf_perf_event_output(ctx, &output, BPF_F_CURRENT_CPU, &data, sizeof(data));
+
+    return 0;
+}

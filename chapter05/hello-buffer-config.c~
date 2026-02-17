@@ -1,0 +1,202 @@
+/*
+ * hello-buffer-config.c（ユーザ空間側 / libbpf skeleton + perf buffer）
+ *
+ * 直した点（コンパイルエラーの原因だったところ）:
+ *   - perf_buffer__new() の API が「新しめの libbpf（opts 方式）」前提になっている。
+ *     あなたの環境の /usr/include/bpf/libbpf.h では
+ *
+ *       perf_buffer__new(int map_fd, size_t page_cnt,
+ *                        perf_buffer_sample_fn sample_cb,
+ *                        perf_buffer_lost_fn lost_cb,
+ *                        const struct perf_buffer_opts *opts);
+ *
+ *     となっており、引数は 5 個である。
+ *     なので「ctx と NULL を渡して 6 引数」にしていた呼び出しを修正する。
+ *
+ *   - sample_cb / lost_cb の型は libbpf が定義する typedef に合わせる必要があるので、
+ *     関数シグネチャを libbpf の型に揃える（警告の解消）。
+ *
+ * 使い方の全体像（アルゴリズム）:
+ *
+ *   ┌───────────────────────────────┐
+ *   │ (1) libbpf のログ出力を設定     │  libbpf_set_print()
+ *   └───────────────┬───────────────┘
+ *                   │
+ *                   v
+ *   ┌───────────────────────────────┐
+ *   │ (2) skeleton を open & load     │  hello_buffer_config_bpf__open_and_load()
+ *   └───────────────┬───────────────┘
+ *                   │
+ *                   v
+ *   ┌───────────────────────────────┐
+ *   │ (3) eBPF を attach              │  hello_buffer_config_bpf__attach()
+ *   └───────────────┬───────────────┘
+ *                   │
+ *                   v
+ *   ┌─────────────────────────────────────────────┐
+ *   │ (4) perf buffer を作る                         │  perf_buffer__new()
+ *   │     - maps.output の fd を渡す                  │  bpf_map__fd(...)
+ *   │     - コールバック: handle_event / lost_event │
+ *   └───────────────┬─────────────────────────────┘
+ *                   │
+ *                   v
+ *   ┌───────────────────────────────┐
+ *   │ (5) poll ループ                │  perf_buffer__poll()
+ *   └───────────────┬───────────────┘
+ *                   │
+ *                   v
+ *   ┌───────────────────────────────┐
+ *   │ (6) 後始末                     │  perf_buffer__free(), __destroy()
+ *   └───────────────────────────────┘
+ */
+
+#include <stdio.h>
+#include <unistd.h>
+#include <errno.h>      /* errno, EINTR */
+#include <stdarg.h>     /* va_list */
+#include <stdbool.h>    /* true/false */
+#include <string.h>     /* strerror */
+#include <bpf/libbpf.h> /* libbpf: skeleton, perf buffer */
+
+#include "hello-buffer-config.h"
+#include "hello-buffer-config.skel.h"
+
+/*
+ * libbpf のログ出力を制御するコールバック。
+ *
+ * libbpf_set_print() に渡すと、libbpf 内部のログがここ経由で出る。
+ * DEBUG レベルはノイズになりがちなので抑制し、それ以外を stderr に流す。
+ */
+static int libbpf_print_fn(enum libbpf_print_level level,
+                           const char *format,
+                           va_list args)
+{
+    if (level >= LIBBPF_DEBUG)
+        return 0;
+    return vfprintf(stderr, format, args);
+}
+
+/*
+ * perf buffer の sample callback（イベントを受け取ったときに呼ばれる）。
+ *
+ * 重要:
+ *   - シグネチャは libbpf が期待する perf_buffer_sample_fn に合わせる。
+ *   - data は eBPF 側が perf_event_output で投げた “生の payload”。
+ *   - ここでは data を struct data_t として解釈する（ABI 一致が前提）。
+ *
+ * NOTE（安全性）:
+ *   - eBPF 側が *_str 系でコピーしていれば NUL 終端になりやすいが、
+ *     100% ではない。必要ならユーザ側でも終端を保証してから表示する。
+ */
+static void handle_event(void *ctx, int cpu, void *data, __u32 data_sz)
+{
+    (void)ctx;
+    (void)cpu;
+    (void)data_sz;
+
+    const struct data_t *m = (const struct data_t *)data;
+
+    printf("%-6d %-6d %-16s %-16s %s\n",
+           m->pid, m->uid, m->command, m->path, m->message);
+}
+
+/*
+ * perf buffer の lost callback（イベント取りこぼし時に呼ばれる）。
+ *
+ * シグネチャは perf_buffer_lost_fn に合わせる。
+ * lost_cnt は「落ちたイベント数」。
+ */
+static void lost_event(void *ctx, int cpu, __u64 lost_cnt)
+{
+    (void)ctx;
+    (void)cpu;
+
+    fprintf(stderr, "lost event: %llu\n", (unsigned long long)lost_cnt);
+}
+
+int main(void)
+{
+    struct hello_buffer_config_bpf *skel = NULL;
+    struct perf_buffer *pb = NULL;
+    int err = 0;
+
+    /* (1) libbpf ログ設定 */
+    libbpf_set_print(libbpf_print_fn);
+
+    /* (2) open & load（verifier を通してロードまで完了） */
+    skel = hello_buffer_config_bpf__open_and_load();
+    if (!skel) {
+        fprintf(stderr, "Failed to open and load BPF object\n");
+        return 1;
+    }
+
+    /* (3) attach（SEC("...") のフックに自動でアタッチ） */
+    err = hello_buffer_config_bpf__attach(skel);
+    if (err) {
+        fprintf(stderr, "Failed to attach BPF skeleton: %d\n", err);
+        hello_buffer_config_bpf__destroy(skel);
+        return 1;
+    }
+
+    /*
+     * (4) perf buffer を作成
+     *
+     * あなたの libbpf では perf_buffer__new は 5 引数版:
+     *   perf_buffer__new(map_fd, page_cnt, sample_cb, lost_cb, opts)
+     *
+     * opts には struct perf_buffer_opts を渡せるが、最小構成なら NULL でよい。
+     */
+    pb = perf_buffer__new(
+        bpf_map__fd(skel->maps.output),
+        8,              /* page_cnt: 2の累乗が推奨。取りこぼしが多ければ増やす */
+        handle_event,    /* sample_cb */
+        lost_event,      /* lost_cb */
+        NULL             /* opts */
+    );
+
+    if (!pb) {
+        /*
+         * 失敗時は errno が立つことが多いので出しておくと原因特定が早い。
+         * 例: EPERM（権限不足）, ENOENT（map fd 不正）など。
+         */
+        err = -errno;
+        fprintf(stderr, "Failed to create perf buffer: %s (errno=%d)\n",
+                strerror(errno), errno);
+        hello_buffer_config_bpf__destroy(skel);
+        return 1;
+    }
+
+    /* (5) poll ループ */
+    while (true) {
+        err = perf_buffer__poll(pb, 100 /* timeout ms */);
+
+        /* Ctrl-C などで割り込みが入ると -EINTR になることがある */
+        if (err == -EINTR) {
+            err = 0;
+            break;
+        }
+
+        /* その他の負値はエラー */
+        if (err < 0) {
+            fprintf(stderr, "Error polling perf buffer: %d\n", err);
+            break;
+        }
+
+        /*
+         * err >= 0 の場合:
+         *   実装によって「処理したイベント数」などが返るが、
+         *   学習用途では特に使わずループ継続でOK。
+         */
+    }
+
+    /* (6) 後始末 */
+    perf_buffer__free(pb);
+    hello_buffer_config_bpf__destroy(skel);
+
+    /*
+     * libbpf の慣習:
+     *   err が負 errno のときがあるので、最終的には 0/非0 で返す。
+     *   ここでは「poll で返った err の符号を正規化」して返す。
+     */
+    return err < 0 ? -err : 0;
+}
